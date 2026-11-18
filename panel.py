@@ -68,15 +68,19 @@ async def index(_):
 async def api_stats(_):
     d = await asyncio.to_thread(db.stats, TIMEZONE)  # heavy queries off the event loop
     d["library"] = library
+    d["radio"] = await asyncio.to_thread(db.radio_stats, TIMEZONE)
+    d["songs"] = await asyncio.to_thread(db.song_panel)
     tz = ZoneInfo(TIMEZONE)
+    d["assistants"] = assistants_fn() if assistants_fn else []
     d["cookies"] = [dict(c, last_ok=(datetime.fromtimestamp(c["last_ok"], tz).strftime("%d %b, %I:%M %p")
                                      if c["last_ok"] else "-")) for c in media.cookie_status()]
     return web.json_response(d)
 
 
 # ---------- Broadcast (sab groups me ek saath message) ----------
-library = {"total_songs": 0, "total_singers": 0, "languages": []}  # main.py set karta hai (sirf admin ko dikhta hai)
+library = {"total_songs": 0, "total_moods": 0, "languages": []}  # main.py set karta hai (sirf admin ko dikhta hai)
 broadcast_fn = None  # main.py set karta hai: async fn(text, state)
+assistants_fn = None  # main.py set karta hai: fn() -> [{tag, status, groups, error}]
 bstate = {"running": False, "done": False, "total": 0, "sent": 0, "failed": 0, "removed": 0}
 _task = None
 
@@ -197,6 +201,7 @@ button:disabled{opacity:.5}
 .tag.ok{background:rgba(22,163,74,.15);color:var(--green)}
 .tag.blocked{background:rgba(217,119,6,.18);color:var(--amber)}
 .tag.dead{background:rgba(220,38,38,.15);color:var(--red)}
+.tag.full,.tag.flood{background:rgba(217,119,6,.18);color:var(--amber)}
 .tag.leave{background:rgba(220,38,38,.15);color:var(--red)}
 </style>
 </head>
@@ -226,6 +231,21 @@ button:disabled{opacity:.5}
 
   <h2>🎵 Song library <span class="sub">(only you can see this)</span></h2>
   <div class="box" id="library"></div>
+
+  <h2>🔥 Songs played <span class="sub">(correct name + times played; <span id="songs_total"></span>)</span></h2>
+  <div class="box" id="songs_top"></div>
+  <h2>⭐ Radio - best rated (like +1)</h2>
+  <div class="box" id="songs_best"></div>
+  <h2>👎 Radio - worst rated (skip -1)</h2>
+  <div class="box" id="songs_worst"></div>
+
+  <h2>📻 Radio - language plays <span class="sub">(saved in DB, only counts)</span></h2>
+  <div class="box" id="radio_langs"></div>
+  <h2>📻 Radio - language + feeling</h2>
+  <div class="box" id="radio_moods"></div>
+
+  <h2>🤖 Assistants <span class="sub">(status resets on restart)</span></h2>
+  <div class="box" id="assistants"></div>
 
   <h2>🍪 YouTube cookies <span class="sub">(status resets on restart)</span></h2>
   <div class="box" id="cookies"></div>
@@ -265,10 +285,29 @@ async function load() {
       .forEach(k => $(k).textContent = d[k]);
 
     const lib = d.library || {languages: []};
-    table($('library'), ['Language', 'Songs', 'Singers'],
-      lib.languages.map(x => [td(x.language), td(x.songs), td(x.singers)])
-        .concat([['<td><b>Total</b></td>', '<td><b>' + esc(lib.total_songs) + '</b></td>', '<td><b>' + esc(lib.total_singers) + '</b></td>']]),
+    table($('library'), ['Language', 'Songs', 'Moods'],
+      lib.languages.map(x => [td(x.language), td(x.songs), td(x.moods)])
+        .concat([['<td><b>Total</b></td>', '<td><b>' + esc(lib.total_songs) + '</b></td>', '<td><b>' + esc(lib.total_moods) + '</b></td>']]),
       'No songs loaded (songs.csv missing?).');
+    const sg = d.songs || {top: [], best: [], worst: [], songs: 0, plays: 0};
+    $('songs_total').textContent = sg.songs + ' songs, ' + sg.plays + ' plays';
+    const sh = ['Song', 'Type', 'Played', '👍', '👎', 'Rating'];
+    const sr = x => [td(x.title, 'wrap'), td(x.kind), td(x.plays), td(x.likes), td(x.skips), td(x.rating)];
+    table($('songs_top'), sh, sg.top.map(sr), 'No songs played yet.');
+    table($('songs_best'), sh, sg.best.map(sr), 'No liked radio songs yet.');
+    table($('songs_worst'), sh, sg.worst.map(sr), 'No skipped radio songs yet.');
+    const rd = d.radio || {languages: [], moods: []};
+    table($('radio_langs'), ['Language', 'Radio started', 'Songs played', 'Today', 'This month'],
+      rd.languages.map(x => [td(x.language), td(x.starts), td(x.songs), td(x.today), td(x.month)]),
+      'No radio played yet.');
+    table($('radio_moods'), ['Language', 'Feeling', 'Radio started', 'Songs played'],
+      rd.moods.map(x => [td(x.language), td(x.mood), td(x.starts), td(x.songs)]),
+      'No radio played yet.');
+    table($('assistants'), ['Assistant', 'Status', 'Groups', 'Last problem'],
+      (d.assistants || []).map(a => [td(a.tag),
+        '<td><span class="tag ' + esc(a.status) + '">' + esc(String(a.status).toUpperCase()) + '</span></td>',
+        td(a.groups + ' / ' + a.cap), td(a.error, 'wrap')]),
+      'No assistants.');
     table($('cookies'), ['Cookie', 'Status', 'Used', 'Blocked', 'Last OK', 'Last error', ''],
       (d.cookies || []).map(c => [td(c.name),
         '<td><span class="tag ' + esc(c.status) + '">' + (c.status === 'ok' ? 'OK' : c.status === 'blocked' ? 'BLOCKED (' + esc(c.rest_min) + ' min)' : 'DEAD') + '</span></td>',
@@ -277,8 +316,8 @@ async function load() {
       'No cookies loaded (set COOKIES_B64, COOKIES_B64_1, ...).');
     table($('errors_grouped'), ['Error', 'Times', 'Groups', 'Last'],
       d.errors_grouped.map(e => [td(e.msg, 'wrap'), td(e.count), td(e.groups), td(e.last)]), 'No errors in the last 24 hours 🎉');
-    table($('errors_recent'), ['Time', 'Group', 'Error'],
-      d.errors_recent.map(e => [td(e.time), td(e.group), td(e.msg, 'wrap')]), 'No errors.');
+    table($('errors_recent'), ['Time', 'Group', 'Error', 'Details'],
+      d.errors_recent.map(e => [td(e.time), td(e.group), td(e.msg, 'wrap'), td(e.detail, 'wrap')]), 'No errors.');
     table($('daily'), ['Date', 'Added', 'Left'],
       d.daily.map(x => [td(x.date), td(x.added), td(x.left)]), 'No data.');
     table($('monthly'), ['Month', 'Added', 'Left'],

@@ -32,6 +32,7 @@ from yt_dlp import YoutubeDL
 from yt_dlp.utils import match_filter_func
 
 import db
+import songtools
 
 log = logging.getLogger("tgmusic.media")
 
@@ -43,8 +44,8 @@ DL_DIR = os.environ.get("DL_DIR", "/tmp/tgm_audio")
 MAX_CACHE_MB = int(os.environ.get("MAX_CACHE_MB", "1500"))
 MAX_DURATION = int(os.environ.get("MAX_DURATION", "900"))  # seconds (15 min), longer = rejected
 MAX_FILESIZE_MB = int(os.environ.get("MAX_FILESIZE_MB", "80"))
-DL_CONCURRENCY = int(os.environ.get("DL_CONCURRENCY", "8"))
-SEARCH_CONCURRENCY = int(os.environ.get("SEARCH_CONCURRENCY", "8"))
+DL_CONCURRENCY = int(os.environ.get("DL_CONCURRENCY", "12"))
+SEARCH_CONCURRENCY = int(os.environ.get("SEARCH_CONCURRENCY", "12"))
 ALLOWED_DOMAINS = [d.strip().lower() for d in
                    os.environ.get("ALLOWED_DOMAINS", "youtube.com,youtu.be,soundcloud.com").split(",")
                    if d.strip()]
@@ -173,7 +174,9 @@ def _cookie_blocked(c: Cookie, ex: Exception):
         state = "DEAD (invalid)" if c.dead else f"blocked for {COOKIE_COOLDOWN // 60} min"
     log.warning("cookie %s %s: %s", c.name, state, msg)
     try:
-        db.log_error(None, f"Cookie '{c.name}' {state}: {msg}")
+        db.log_error(None, f"Cookie '{c.name}' {state}", None, code="YT_COOKIE",
+                     hint="YouTube refused this cookie: add more cookies / a proxy, or re-export it "
+                          "from a fresh browser session", detail=msg)
     except Exception:
         pass
 
@@ -331,7 +334,8 @@ def _search_once(prefix: str, query: str, cookie: Cookie | None) -> dict | None:
         url = f"https://www.youtube.com/watch?v={best['id']}"
     if not url:
         return None
-    return {"title": best.get("title") or query, "page": url, "duration": best.get("duration")}
+    return {"title": songtools.clean_title(best.get("title")) or best.get("title") or query,
+            "page": url, "duration": best.get("duration")}
 
 
 def _search_sync(query: str) -> dict | None:
