@@ -84,6 +84,18 @@ try:  # older databases (before error codes) get the new column
     con.execute("ALTER TABLE errors ADD COLUMN detail TEXT")
 except sqlite3.OperationalError:
     pass
+con.executescript("""
+CREATE TABLE IF NOT EXISTS cost_feature (
+    day TEXT NOT NULL, feature TEXT NOT NULL,
+    cpu_s REAL NOT NULL DEFAULT 0, ram_gbh REAL NOT NULL DEFAULT 0, egr_gb REAL NOT NULL DEFAULT 0,
+    PRIMARY KEY (day, feature)
+);
+CREATE TABLE IF NOT EXISTS cost_song (
+    key TEXT PRIMARY KEY, title TEXT, kind TEXT,
+    stream_s REAL NOT NULL DEFAULT 0, cpu_s REAL NOT NULL DEFAULT 0,
+    ram_gbh REAL NOT NULL DEFAULT 0, egr_gb REAL NOT NULL DEFAULT 0
+);
+""")
 con.commit()
 
 _ANSI = re.compile(r"\x1b\[[0-9;]*m")
@@ -406,6 +418,47 @@ def song_panel(limit: int = 30) -> dict:
         "worst": [row(r) for r in _q(f"SELECT {cols} FROM song_stats WHERE kind='radio' AND likes-skips<0 "
                                      "ORDER BY likes-skips ASC, plays DESC LIMIT 10")],
     }
+
+
+# ---------- kharcha (costs.py ise use karta hai) ----------
+@_locked
+def cost_flush(feats: dict, songs: dict):
+    """feats: {(day, feature): [cpu_s, ram_gbh, egr_gb]}, songs: {key: [title, kind, stream_s, cpu_s, ram_gbh, egr_gb]}"""
+    con.executemany(
+        "INSERT INTO cost_feature(day,feature,cpu_s,ram_gbh,egr_gb) VALUES(?,?,?,?,?) "
+        "ON CONFLICT(day,feature) DO UPDATE SET cpu_s=cpu_s+excluded.cpu_s, "
+        "ram_gbh=ram_gbh+excluded.ram_gbh, egr_gb=egr_gb+excluded.egr_gb",
+        [(d, f, v[0], v[1], v[2]) for (d, f), v in feats.items()])
+    con.executemany(
+        "INSERT INTO cost_song(key,title,kind,stream_s,cpu_s,ram_gbh,egr_gb) VALUES(?,?,?,?,?,?,?) "
+        "ON CONFLICT(key) DO UPDATE SET title=COALESCE(excluded.title,title), "
+        "stream_s=stream_s+excluded.stream_s, cpu_s=cpu_s+excluded.cpu_s, "
+        "ram_gbh=ram_gbh+excluded.ram_gbh, egr_gb=egr_gb+excluded.egr_gb",
+        [(k, v[0], v[1], v[2], v[3], v[4], v[5]) for k, v in songs.items()])
+    con.execute("DELETE FROM cost_feature WHERE day < date('now','-400 day')")
+    con.commit()
+
+
+def cost_features() -> list:
+    return _q("SELECT day, feature, cpu_s, ram_gbh, egr_gb FROM cost_feature")
+
+
+def cost_songs(a: float, b: float, c: float, limit: int = 40) -> list:
+    """Sabse mahange gaane. a = $/RAM-GB-hour, b = $/CPU-second, c = $/egress-GB."""
+    flush_buffers()  # plays ginti taaza ho
+    return _q("SELECT k.key, k.title, k.kind, COALESCE(s.plays,0), k.stream_s, k.cpu_s, k.ram_gbh, k.egr_gb "
+              "FROM cost_song k LEFT JOIN song_stats s ON s.key=k.key "
+              "ORDER BY (k.ram_gbh*? + k.cpu_s*? + k.egr_gb*?) DESC LIMIT ?", a, b, c, limit)
+
+
+def song_export() -> tuple[list, list]:
+    """Owner /file ke liye: (sab baje gaane, radio ratings). Pura data, koi limit nahi."""
+    flush_buffers()
+    played = _q("SELECT title, kind, plays, likes, skips, last_played FROM song_stats "
+                "WHERE plays>0 ORDER BY plays DESC, last_played DESC")
+    radio = _q("SELECT title, plays, likes, skips, likes-skips, last_played FROM song_stats "
+               "WHERE kind='radio' ORDER BY likes-skips DESC, plays DESC, title")
+    return played, radio
 
 
 # ---------- per-group settings ----------

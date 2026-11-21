@@ -1,3 +1,33 @@
+# v13 - is update me kya badla
+
+## Admin panel: kharcha (cost) tracker
+- "Estimated cost by feature": idle bot, /play streaming, radio streaming, song download, storage upload, play card, broadcast - aaj / is mahine / total (+ CPU ghante, RAM GB-ghante, egress GB).
+- "Cost per song": har gaane ka stream minutes, egress MB, kharcha aur kharcha per play (sabse mahange pehle).
+- Ye ANUMAAN hai (CPU + RAM + egress naap kar baanta jata hai), Railway ka invoice nahi. Railway > Usage se milao, fark ho to COST_SCALE badlo.
+- Naya file costs.py, requirements me psutil, 2 naye DB table (cost_feature, cost_song). Dockerfile me costs.py COPY.
+- Naye env (optional): COST_RAM_GB_MONTH, COST_CPU_VCPU_MONTH, COST_EGRESS_GB, AUDIO_KBPS, COST_SCALE (.env.example dekho).
+
+## /file (sirf OWNER_ID)
+- Owner ke private chat me 2 CSV aati hain: songs_played.csv (kaun sa gaana kitni baar baja) aur radio_ratings.csv (radio gaano ki likes / skips / rating).
+- Group me chalao to bhi file DM me aati hai. Pehle bot ko private me ek baar /start karna zaroori. Command menu me nahi dikhta.
+
+# v11 - is update me kya badla
+
+## Play card (naya design)
+- Gaane ki asli photo (YouTube thumbnail) background me blur hoti hai aur wahi photo beech me box me dikhti hai.
+- Photo ke dono taraf equalizer bars, upar NOW PLAYING, gaane ka naam blue box me, progress bar, time, prev/pause/next, Requested by.
+- Photo na mile (SoundCloud / download fail) to rangeen art tile + vinyl, card kabhi fail nahi hota.
+- Card ke neeche ka text 2 quote box me (blue patti): "Started Streaming" aur Title / Duration / By (/ Rating). Reject ho to purana caption.
+
+## Rangeen buttons
+- Pause / Skip / Loop / Help / Support / Update / Open radio menu = blue, Resume / Add me / Open bot / Like = green, Stop = red.
+- Library ya Telegram support na kare to normal buttons (kuch tootta nahi). .env: BUTTON_COLORS=0 se band.
+
+## Voice chat: join / invite messages
+- /vcjoin on|off (default on). /setup me status.
+- Koi VC join kare: "X joined the voice chat" (VC_JOIN_DELETE_SEC = 10 sec baad delete). Sirf tab jab assistant VC me ho (gaana chal raha ho).
+- Koi VC me invite kare: "A invited B to the voice chat" + Open bot button (VC_INVITE_DELETE_SEC = 30 sec baad delete).
+
 # v9 - is update me kya badla
 
 ## 1000 group

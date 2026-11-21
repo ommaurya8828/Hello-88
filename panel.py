@@ -11,6 +11,7 @@ from zoneinfo import ZoneInfo
 
 from aiohttp import web
 
+import costs
 import db
 import media
 
@@ -70,6 +71,7 @@ async def api_stats(_):
     d["library"] = library
     d["radio"] = await asyncio.to_thread(db.radio_stats, TIMEZONE)
     d["songs"] = await asyncio.to_thread(db.song_panel)
+    d["costs"] = await asyncio.to_thread(costs.panel, TIMEZONE)
     tz = ZoneInfo(TIMEZONE)
     d["assistants"] = assistants_fn() if assistants_fn else []
     d["cookies"] = [dict(c, last_ok=(datetime.fromtimestamp(c["last_ok"], tz).strftime("%d %b, %I:%M %p")
@@ -234,6 +236,12 @@ button:disabled{opacity:.5}
 
   <h2>🔥 Songs played <span class="sub">(correct name + times played; <span id="songs_total"></span>)</span></h2>
   <div class="box" id="songs_top"></div>
+  <h2>💸 Estimated cost by feature <span class="sub">(estimate, not the Railway invoice)</span></h2>
+  <div class="box" id="cost_feat"></div>
+  <div class="sub" id="cost_note" style="margin:6px 4px 14px"></div>
+  <h2>💸 Cost per song <span class="sub">(most expensive first; streaming + download + upload + card)</span></h2>
+  <div class="box" id="cost_songs"></div>
+
   <h2>⭐ Radio - best rated (like +1)</h2>
   <div class="box" id="songs_best"></div>
   <h2>👎 Radio - worst rated (skip -1)</h2>
@@ -296,6 +304,23 @@ async function load() {
     table($('songs_top'), sh, sg.top.map(sr), 'No songs played yet.');
     table($('songs_best'), sh, sg.best.map(sr), 'No liked radio songs yet.');
     table($('songs_worst'), sh, sg.worst.map(sr), 'No skipped radio songs yet.');
+    const cs = d.costs || {features: [], totals: {}, songs: [], rates: {}};
+    const usd = v => '$' + Number(v || 0).toFixed(v >= 1 ? 2 : 4);
+    const ct = cs.totals || {};
+    table($('cost_feat'), ['Feature', 'Today', 'This month', 'All time', 'CPU h', 'RAM GB-h', 'Egress GB'],
+      cs.features.map(f => [td(f.feature, 'wrap'), td(usd(f.today)), td(usd(f.month)), td(usd(f.total)),
+        td(f.cpu_h.toFixed(2)), td(f.ram_gbh.toFixed(2)), td(f.egr_gb.toFixed(3))])
+        .concat(cs.features.length ? [['<td><b>Total</b></td>', '<td><b>' + usd(ct.today) + '</b></td>',
+          '<td><b>' + usd(ct.month) + '</b></td>', '<td><b>' + usd(ct.total) + '</b></td>', '<td></td>', '<td></td>', '<td></td>']] : []),
+      'No usage recorded yet (wait a few minutes after start).');
+    const rt = cs.rates || {};
+    $('cost_note').textContent = 'Projected this month: ' + usd(ct.est_month) + '. Rates used: RAM $' + rt.ram_gb_month +
+      '/GB-month, CPU $' + rt.cpu_vcpu_month + '/vCPU-month, egress $' + rt.egress_gb + '/GB, stream ' + rt.kbps +
+      ' kbps, scale x' + rt.scale + '. Compare with Railway > Usage; if different, change COST_SCALE (or the COST_* variables).';
+    table($('cost_songs'), ['Song', 'Type', 'Played', 'Stream min', 'Egress MB', 'Cost', 'Cost / play'],
+      (cs.songs || []).map(x => [td(x.title, 'wrap'), td(x.kind), td(x.plays), td(x.stream_min), td(x.egr_mb),
+        td(usd(x.cost)), td(x.per_play == null ? '-' : usd(x.per_play))]),
+      'No song cost recorded yet.');
     const rd = d.radio || {languages: [], moods: []};
     table($('radio_langs'), ['Language', 'Radio started', 'Songs played', 'Today', 'This month'],
       rd.languages.map(x => [td(x.language), td(x.starts), td(x.songs), td(x.today), td(x.month)]),

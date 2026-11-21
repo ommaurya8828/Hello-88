@@ -39,11 +39,11 @@ log = logging.getLogger("tgmusic.media")
 # ---- config (all overridable via environment variables) ----
 # PROXY: one proxy, or several separated by comma/space (a random one is used per request)
 PROXIES = [p for p in re.split(r"[,\s]+", os.environ.get("PROXY", "")) if p]
-COOKIE_COOLDOWN = int(os.environ.get("COOKIE_COOLDOWN", "1800"))  # seconds a blocked cookie rests
+COOKIE_COOLDOWN = int(os.environ.get("COOKIE_COOLDOWN", "21600"))  # seconds a blocked cookie rests
 DL_DIR = os.environ.get("DL_DIR", "/tmp/tgm_audio")
 MAX_CACHE_MB = int(os.environ.get("MAX_CACHE_MB", "1500"))
-MAX_DURATION = int(os.environ.get("MAX_DURATION", "900"))  # seconds (15 min), longer = rejected
-MAX_FILESIZE_MB = int(os.environ.get("MAX_FILESIZE_MB", "80"))
+MAX_DURATION = int(os.environ.get("MAX_DURATION", "3600"))  # seconds (60 min), longer = rejected
+MAX_FILESIZE_MB = int(os.environ.get("MAX_FILESIZE_MB", "150"))
 DL_CONCURRENCY = int(os.environ.get("DL_CONCURRENCY", "12"))
 SEARCH_CONCURRENCY = int(os.environ.get("SEARCH_CONCURRENCY", "12"))
 ALLOWED_DOMAINS = [d.strip().lower() for d in
@@ -171,7 +171,7 @@ def _cookie_blocked(c: Cookie, ex: Exception):
             c.dead = True
         else:
             c.blocked_until = time.time() + COOKIE_COOLDOWN
-        state = "DEAD (invalid)" if c.dead else f"blocked for {COOKIE_COOLDOWN // 60} min"
+        state = "DEAD (invalid)" if c.dead else f"blocked for {COOKIE_COOLDOWN // 3600} h"
     log.warning("cookie %s %s: %s", c.name, state, msg)
     try:
         db.log_error(None, f"Cookie '{c.name}' {state}", None, code="YT_COOKIE",
@@ -314,7 +314,7 @@ def _score(query: str, e: dict) -> float:
     # whole-word match only ("alive" must not count as "live")
     s -= 25 * len(set(_BAD_RE.findall(title)) - set(_BAD_RE.findall(q)))
     dur = e.get("duration") or 0
-    if dur > 900:  # longer than 15 min = mix / podcast
+    if dur > MAX_DURATION:  # longer than the allowed limit = mix / podcast
         s -= 40
     if 0 < dur < 45:
         s -= 30

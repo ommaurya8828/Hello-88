@@ -34,6 +34,7 @@ from pytgcalls import PyTgCalls
 from pytgcalls.types import AudioQuality, MediaStream
 
 import card
+import costs
 import db
 import media
 import panel
@@ -329,22 +330,50 @@ def report(chat_id: int | None, where: str, ex: Exception, song: dict | None = N
     return d
 
 
+try:  # coloured buttons (Bot API 9.4+). Older library -> normal buttons, nothing breaks.
+    from pyrogram.enums import ButtonStyle
+except Exception:
+    ButtonStyle = None
+_STYLE_OK = (os.getenv("BUTTON_COLORS", "1") != "0" and ButtonStyle is not None
+             and "style" in inspect.signature(InlineKeyboardButton.__init__).parameters)
+
+
+def ibtn(text: str, style: str | None = None, **kw) -> InlineKeyboardButton:
+    """Inline button; style = 'primary' (blue) | 'success' (green) | 'danger' (red) when the library supports it."""
+    if style and _STYLE_OK:
+        st = getattr(ButtonStyle, style.upper(), None)
+        if st is not None:
+            try:
+                return InlineKeyboardButton(text, style=st, **kw)
+            except Exception as ex:
+                log.debug("button style not accepted (%s)", ex)
+    return InlineKeyboardButton(text, **kw)
+
+
+def _unstyled(markup):
+    """Same keyboard without colours (used if Telegram/library rejects styled buttons)."""
+    try:
+        return InlineKeyboardMarkup([[InlineKeyboardButton(b.text, callback_data=b.callback_data, url=b.url)
+                                      for b in row] for row in markup.inline_keyboard])
+    except Exception:
+        return markup
+
+
 def buttons(chat_id: int) -> InlineKeyboardMarkup:
-    lp = "🔂 Loop ON" if loops.get(chat_id) else "🔁 Loop"
+    looping = bool(loops.get(chat_id))
+    lp = "🔂 Loop ON" if looping else "🔁 Loop"
     rows = [[
-        InlineKeyboardButton("⏸ Pause", callback_data="pause"),
-        InlineKeyboardButton("▶️ Resume", callback_data="resume"),
-        InlineKeyboardButton("⏭ Skip", callback_data="skip"),
+        ibtn("⏸ Pause", "primary", callback_data="pause"),
+        ibtn("▶️ Resume", "success", callback_data="resume"),
+        ibtn("⏭ Skip", "primary", callback_data="skip"),
     ], [
-        InlineKeyboardButton(lp, callback_data="loop"),
-        InlineKeyboardButton("⏹ Stop", callback_data="stop"),
+        ibtn(lp, "success" if looping else "primary", callback_data="loop"),
+        ibtn("⏹ Stop", "danger", callback_data="stop"),
     ]]
     q = queues.get(chat_id)
     cur = q[0] if q else None
     if cur and cur.get("radio") and cur.get("tok"):  # radio: 👍 Like = rating +1
-        r = db.song_rating(cur.get("skey") or "")
-        rows.append([InlineKeyboardButton(f"👍 Like ({r:+d})" if r else "👍 Like",
-                                          callback_data=f"like:{cur['tok']}")])
+        rows.append([ibtn("👍 Like", "success", callback_data=f"like:{cur['tok']}")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -356,34 +385,95 @@ def fmt_dur(sec) -> str:
     return f"{sec // 60}:{sec % 60:02d} min"
 
 
-def now_playing_text(song: dict) -> str:
-    title = html.escape(song.get("title") or song.get("page") or "Unknown")
+_SC = str.maketrans("abcdefghijklmnopqrstuvwxyz", "ᴀʙᴄᴅᴇꜰɢʜɪᴊᴋʟᴍɴᴏᴘǫʀsᴛᴜᴠᴡxʏᴢ")
+
+
+def _sc(text: str) -> str:
+    """Small-caps look (ᴛɪᴛʟᴇ) for the labels."""
+    return text.lower().translate(_SC)
+
+
+def now_playing_text(song: dict, quote: bool = True) -> str:
+    """Caption under the play card. quote=True: two Telegram quote boxes (blue bar), quote=False: old plain look."""
+    raw = (song.get("title") or song.get("page") or "Unknown")[:150]  # short enough that the caption never gets cut mid-tag
+    title = html.escape(raw)
     page = song.get("page")
     if page and str(page).startswith("http"):
         title = f'<a href="{html.escape(str(page), quote=True)}">{title}</a>'  # blue clickable title
     by = html.escape(str(song.get("by") or ""))
-    extra = ""
-    if song.get("radio") and song.get("skey"):
-        extra += f"\n<b>Rating:</b> {db.song_rating(song['skey']):+d}"
-    return (f"<u><b>Started streaming</b></u>\n\n"
-            f"<b>Title:</b> {title}\n\n"
-            f"<b>Duration:</b> {fmt_dur(song.get('duration'))}\n"
-            f"<b>Requested by:</b> {by}{extra}")
+    rating = ""  # rating is hidden from users (still counted in the DB / admin panel)
+    if not quote:
+        extra = f"\n<b>Rating:</b> {rating:+d}" if rating != "" else ""
+        return (f"<u><b>Started streaming</b></u>\n\n"
+                f"<b>Title:</b> {title}\n\n"
+                f"<b>Duration:</b> {fmt_dur(song.get('duration'))}\n"
+                f"<b>Requested by:</b> {by}{extra}")
+    lines = [f"○ <b>{_sc('Title')} :</b> {title}",
+             f"○ <b>{_sc('Duration')} :</b> {fmt_dur(song.get('duration'))}",
+             f"○ <b>{_sc('By')} :</b> {by}"]
+    if rating != "":
+        lines.append(f"○ <b>{_sc('Rating')} :</b> {rating:+d}")
+    return (f"<blockquote>❖ <b>{_sc('Started')} {_sc('Streaming')}</b></blockquote>\n"
+            f"<blockquote>" + "\n".join(lines) + "</blockquote>")
+
+
+_thumb_cache: dict[str, bytes] = {}
+
+
+async def song_photo(song: dict) -> bytes | None:
+    """YouTube thumbnail (the song's real photo) for the play card. None if not available -> card uses its own art."""
+    key = songtools.song_key(song.get("page"))
+    if not key or not key.startswith("yt:"):
+        return None
+    vid = key[3:]
+    if vid in _thumb_cache:
+        return _thumb_cache[vid]
+    try:
+        import aiohttp
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=6)) as ses:
+            for name in ("maxresdefault", "hqdefault"):  # HD first, normal as fallback
+                async with ses.get(f"https://i.ytimg.com/vi/{vid}/{name}.jpg") as r:
+                    if r.status != 200:
+                        continue
+                    data = await r.read()
+                    if len(data) < 3000:  # tiny grey placeholder, not a real photo
+                        continue
+                    if len(_thumb_cache) >= 64:
+                        _thumb_cache.pop(next(iter(_thumb_cache)))
+                    _thumb_cache[vid] = data
+                    return data
+    except Exception as ex:
+        log.debug("thumbnail fetch failed (%s %s)", type(ex).__name__, ex)
+    return None
 
 
 async def say_card(chat_id: int, song: dict, **kw):
-    """Colourful now-playing image + the usual text as caption. Any failure -> plain text message."""
+    """Now-playing image (blurred song photo + photo in a box) with the text in quote boxes as caption.
+    Fallbacks: plain caption -> plain text message."""
     text = now_playing_text(song)
+    plain = now_playing_text(song, quote=False)
     try:
-        img = await asyncio.to_thread(card.make_card, song.get("title") or song.get("page") or "",
-                                      fmt_dur(song.get("duration")), str(song.get("by") or ""),
-                                      song.get("skey") or "")
-        bio = io.BytesIO(img)
-        bio.name = "card.jpg"
-        return await bot.send_photo(chat_id, bio, caption=text[:1000], parse_mode=ParseMode.HTML, **kw)
+        with costs.job("card", lambda: _cost_ident(song)):
+            photo = await song_photo(song)
+            img = await asyncio.to_thread(card.make_card, song.get("title") or song.get("page") or "",
+                                          fmt_dur(song.get("duration")), str(song.get("by") or ""),
+                                          song.get("skey") or "", photo)
     except Exception as ex:
-        log.warning("play card failed (%s %s), sending text", type(ex).__name__, ex)
-        return await say(chat_id, text, parse_mode=ParseMode.HTML, disable_web_page_preview=True, **kw)
+        log.warning("play card image failed (%s %s), sending text", type(ex).__name__, ex)
+        img = None
+    if img:
+        attempts = [(text, kw), (plain, kw)]  # quote boxes first; if rejected, the old caption
+        if _STYLE_OK and kw.get("reply_markup") is not None:  # last try: same card, buttons without colours
+            attempts.append((plain, {**kw, "reply_markup": _unstyled(kw["reply_markup"])}))
+        for cap, k in attempts:
+            try:
+                bio = io.BytesIO(img)
+                bio.name = "card.jpg"
+                costs.add_egress("card", lambda: _cost_ident(song), len(img))
+                return await bot.send_photo(chat_id, bio, caption=cap[:1000], parse_mode=ParseMode.HTML, **k)
+            except Exception as ex:
+                log.warning("play card send failed (%s %s)", type(ex).__name__, ex)
+    return await say(chat_id, plain, parse_mode=ParseMode.HTML, disable_web_page_preview=True, **kw)
 
 
 async def is_admin(chat_id: int, user_id: int) -> bool:
@@ -645,11 +735,14 @@ async def _upload_to_channel(key: str, path: str, title: str | None, dur, page: 
                 if not os.path.exists(path):  # cache cleanup removed it while we waited
                     return
                 m = None
+                _ident = lambda: (songtools.song_key(page) or key, title or key, "play")
                 for attempt in range(2):
                     try:
-                        m = await bot.send_audio(STORAGE_CHANNEL, path, title=(title or "")[:60],
-                                                 duration=int(dur or 0),
-                                                 caption=f"{key}\n{page or ''}"[:900])
+                        with costs.job("upload", _ident):
+                            m = await bot.send_audio(STORAGE_CHANNEL, path, title=(title or "")[:60],
+                                                     duration=int(dur or 0),
+                                                     caption=f"{key}\n{page or ''}"[:900])
+                        costs.add_egress("upload", _ident, os.path.getsize(path) if os.path.exists(path) else 0)
                         break
                     except Exception as ex:
                         if type(ex).__name__ == "FloodWait" and attempt == 0:
@@ -672,6 +765,26 @@ async def _upload_to_channel(key: str, path: str, title: str | None, dur, page: 
         _uploading.discard(key)
 
 
+def _cost_ident(song: dict) -> tuple:
+    """(key, title, kind): admin panel ke kharcha table me gaane ki pehchaan (song_stats wali key)."""
+    kind = "radio" if song.get("radio") else "play"
+    key = (song.get("skey") or song.get("rkey") or songtools.song_key(song.get("page"))
+           or songtools.title_key(song.get("title") or song.get("query")))
+    return key, (song.get("title") or song.get("query") or key), kind
+
+
+def _streams_now() -> list:
+    """Jo gaane is waqt sach me baj rahe hain (pause nahi). costs.py har 15 sec me puchta hai."""
+    out = []
+    for q in list(queues.values()):
+        try:
+            if q and q[0].get("started") and not q[0].get("paused_at"):
+                out.append(_cost_ident(q[0]))
+        except Exception:
+            pass
+    return out
+
+
 async def get_audio(song: dict) -> tuple[str, str, int | None]:
     """(local file, title, duration): Telegram storage first, YouTube/SoundCloud otherwise."""
     key = _cache_key(song)
@@ -679,7 +792,8 @@ async def get_audio(song: dict) -> tuple[str, str, int | None]:
         row = await asyncio.to_thread(db.tgcache_get, key)
         if row:
             try:
-                path = await _from_telegram(key, row)
+                with costs.job("download", lambda: _cost_ident(song)):
+                    path = await _from_telegram(key, row)
                 if row.get("page") and not song.get("page"):
                     song["page"] = row["page"]  # keeps the clickable title
                 return path, row["title"] or song.get("title") or "song", row["duration"]
@@ -687,12 +801,14 @@ async def get_audio(song: dict) -> tuple[str, str, int | None]:
                 log.warning("storage download failed (%s): %s %s", key, type(ex).__name__, ex)
                 await asyncio.to_thread(db.tgcache_delete, key)  # stale file_id -> re-store below
     if not song.get("page"):
-        found = await media.search(song["query"])
+        with costs.job("download", lambda: _cost_ident(song)):
+            found = await media.search(song["query"])
         if not found:
             raise media.MediaError("Song not found.")
         song["page"] = found["page"]
         song["duration"] = song.get("duration") or found.get("duration")
-    path, title, dur = await media.fetch(song["page"])
+    with costs.job("download", lambda: _cost_ident(song)):
+        path, title, dur = await media.fetch(song["page"])
     if STORAGE_CHANNEL and key:
         spawn(_upload_to_channel(key, path, title, dur or song.get("duration"), song["page"]))
     return path, title, dur
@@ -878,6 +994,8 @@ async def on_update(_, update):
         names = {c.__name__ for c in type(update).__mro__}
         if names & {"StreamEnded", "StreamAudioEnded"}:
             await _on_stream_end(update.chat_id)
+        elif "UpdatedGroupCallParticipant" in names:
+            await _on_vc_participant(update)  # someone joined / left the voice chat
         elif "ChatUpdate" in names:
             # bot kicked / voice chat closed: drop the queue so no stale state is left
             status = str(getattr(update, "status", ""))
@@ -901,7 +1019,7 @@ ACTIVE_STATUS = (ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMe
 
 def _enable_notices(chat_id: int):
     """Bot just added: welcome + voice chat notices start ON (a choice made earlier is kept)."""
-    for key in ("welcome", "vcnotice"):
+    for key in ("welcome", "vcnotice", "vcjoin"):
         if not db.setting_get(chat_id, key, ""):
             db.setting_set(chat_id, key, "1")
 
@@ -963,11 +1081,11 @@ HELP_TEXT = (
     "/pause - pause\n/resume - resume\n/skip - next song\n"
     "/stop - stop and leave\n/queue - show queue\n/loop - loop on/off\n"
     "/radio - 📻 automatic trending songs (choose language + feeling, admins only)\n\n"
-    "<b>Radio rating</b>\n"
-    "👍 Like = song rating +1, ⏭ Skip = song rating -1. Liked songs play more often.\n\n"
+    "👍 Like and ⏭ Skip on radio songs help me pick better songs.\n\n"
     "<b>Admins</b>\n"
     "/setup - check what is missing (bot rights, assistant, voice chat)\n"
     "/vcnotice on|off - voice chat start/end messages\n"
+    "/vcjoin on|off - 'joined / invited to voice chat' messages (auto-deleted)\n"
     "/welcome on|off - welcome new members"
 )
 BOT_COMMANDS = [("play", "Play a song (name or link)"), ("pause", "Pause"), ("resume", "Resume"),
@@ -998,16 +1116,16 @@ async def reply_safe(m: Message, text: str, **kw):
 def start_kb(back: bool = False) -> InlineKeyboardMarkup:
     if back:
         return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="home")]])
-    rows = [[InlineKeyboardButton(
-        "➕ Add me to your group",
+    rows = [[ibtn(
+        "➕ Add me to your group", "success",
         url=f"https://t.me/{BOT_USERNAME}?startgroup=true&admin=manage_video_chats+delete_messages+invite_users")]]
-    row1 = [InlineKeyboardButton("📖 Help", callback_data="cmds")]
+    row1 = [ibtn("📖 Help", "primary", callback_data="cmds")]
     if SUPPORT_URL:
-        row1.append(InlineKeyboardButton("💬 Support", url=SUPPORT_URL))
+        row1.append(ibtn("💬 Support", "primary", url=SUPPORT_URL))
     rows.append(row1)
     upd = update_url()
     if upd:
-        rows.append([InlineKeyboardButton("📢 Update", url=upd)])
+        rows.append([ibtn("📢 Update", "primary", url=upd)])
     return InlineKeyboardMarkup(rows)
 
 
@@ -1094,6 +1212,40 @@ async def set_update(_, m: Message):
         return await m.reply_text("❌ Send a link like https://t.me/YourChannel or @YourChannel")
     db.setting_set(0, "update_url", arg)
     await m.reply_text(f"✅ Update button set: {arg}")
+
+
+def _csv_file(name: str, head: list, rows: list) -> io.BytesIO:
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(head)
+    w.writerows(rows)
+    bio = io.BytesIO(buf.getvalue().encode("utf-8-sig"))  # utf-8-sig: Excel me Hindi/Punjabi naam sahi dikhte hain
+    bio.name = name
+    return bio
+
+
+@bot.on_message(filters.command("file"))
+async def owner_file(_, m: Message):
+    """Owner only: /file -> 2 CSV owner ke private chat me: (1) kaun sa gaana kitni baar baja,
+    (2) radio gaano ki rating. Group me chalao to bhi file DM me aati hai."""
+    if not OWNER_ID or not m.from_user or m.from_user.id != OWNER_ID:
+        return
+    tz = ZoneInfo(os.environ.get("TIMEZONE", "Asia/Kolkata"))
+    when = lambda ts: datetime.fromtimestamp(ts, tz).strftime("%Y-%m-%d %H:%M") if ts else ""
+    try:
+        played, radio = await asyncio.to_thread(db.song_export)
+        f1 = _csv_file("songs_played.csv", ["No", "Song", "Type", "Played (times)", "Likes", "Skips", "Rating", "Last played"],
+                       [[i, r[0], r[1], r[2], r[3], r[4], r[3] - r[4], when(r[5])] for i, r in enumerate(played, 1)])
+        f2 = _csv_file("radio_ratings.csv", ["No", "Song", "Played (times)", "Likes (+1)", "Skips (-1)", "Rating", "Last played"],
+                       [[i, r[0], r[1], r[2], r[3], r[4], when(r[5])] for i, r in enumerate(radio, 1)])
+        total = sum(r[2] for r in played)
+        await bot.send_document(OWNER_ID, f1, caption=f"🎵 Songs played: {len(played)} songs, {total} plays (most played first)")
+        await bot.send_document(OWNER_ID, f2, caption=f"📻 Radio ratings: {len(radio)} songs (best rated first)")
+        if m.chat.type != ChatType.PRIVATE:
+            await m.reply_text("✅ Files sent to your private chat.")
+    except Exception as ex:
+        report(None, "/file failed", ex)
+        await m.reply_text(f"❌ Couldn't send files: {type(ex).__name__}. Press /start in the bot's private chat once, then try again.")
 
 
 @bot.on_message(filters.command("play") & filters.group)
@@ -1297,7 +1449,7 @@ async def do_skip(chat_id: int) -> str:
         if gone.get("radio") and gone.get("started") and gone.get("skey"):  # radio skip = rating -1
             try:
                 r = db.song_vote(gone["skey"], gone.get("title"), -1, "radio")
-                note = f" (👎 rating {r:+d})"
+                note = ""
             except Exception as ex:
                 log.debug("skip vote failed: %s", ex)
         loops[chat_id] = False
@@ -1436,6 +1588,79 @@ async def vc_ended(_, m: Message):
         log.warning("vc_ended error: %s", ex)
 
 
+# ---------------- VC: "X joined the voice chat" + "X invited Y to the voice chat" (auto-deleted) ----------------
+VC_JOIN_DEFAULT = os.environ.get("VC_JOIN_DEFAULT", "1")  # "1" = on for groups that never chose
+VC_JOIN_DELETE_SEC = int(os.environ.get("VC_JOIN_DELETE_SEC", "10"))  # "joined" message is deleted after this
+VC_INVITE_DELETE_SEC = int(os.environ.get("VC_INVITE_DELETE_SEC", "30"))  # "invited" message is deleted after this
+_vc_seen: dict[tuple[int, int], float] = {}  # (chat, user) -> time: same join can arrive twice
+_vc_log: dict[int, list[float]] = {}  # chat -> recent join messages (mass-join guard)
+
+
+def _mention(u) -> str:
+    return f'<a href="tg://user?id={u.id}">{html.escape(getattr(u, "first_name", None) or "friend")}</a>'
+
+
+def _open_bot_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[ibtn("🎧 Open bot", "success", url=f"https://t.me/{BOT_USERNAME}?start=hi")]])
+
+
+async def _on_vc_participant(update):
+    """Assistant sees a participant change in the voice chat. Only 'joined' is announced."""
+    p = getattr(update, "participant", None)
+    chat_id = getattr(update, "chat_id", None)
+    if p is None or chat_id is None:
+        return
+    if "JOINED" not in str(getattr(p, "action", "")).upper():
+        return
+    uid = getattr(p, "user_id", None)
+    if not uid or uid < 0 or uid == BOT_ID or any(a.uid == uid for a in ASSISTANTS):
+        return
+    if not _setting_on(chat_id, "vcjoin", VC_JOIN_DEFAULT):
+        return
+    now = time.time()
+    if now - _vc_seen.get((chat_id, uid), 0) < 20:
+        return
+    if len(_vc_seen) > 5000:
+        _vc_seen.clear()
+    _vc_seen[(chat_id, uid)] = now
+    recent = [t for t in _vc_log.get(chat_id, []) if now - t < 60]
+    if len(recent) >= 6:  # many people joining at once: stay quiet
+        return
+    recent.append(now)
+    if len(_vc_log) > 2000:
+        _vc_log.clear()
+    _vc_log[chat_id] = recent
+    try:
+        u = await bot.get_users(uid)
+        who = _mention(u)
+    except Exception:
+        who = f'<a href="tg://user?id={uid}">Someone</a>'
+    msg = await say(chat_id, f"🎙 {who} joined the voice chat.", parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True)
+    spawn(_delete_later(msg, VC_JOIN_DELETE_SEC))
+
+
+@bot.on_message(filters.group & filters.video_chat_members_invited, group=7)
+async def vc_invited(_, m: Message):
+    """Someone invited people to the voice chat: say it, and invite them to the bot too."""
+    try:
+        if not _setting_on(m.chat.id, "vcjoin", VC_JOIN_DEFAULT):
+            return
+        users = [u for u in (getattr(m.video_chat_members_invited, "users", None) or []) if not u.is_bot]
+        if not users:
+            return
+        names = ", ".join(_mention(u) for u in users[:5])
+        by = _mention(m.from_user) if m.from_user else "Someone"
+        msg = await say(m.chat.id,
+                        f"📨 {by} invited {names} to the voice chat.\n"
+                        "🎧 I'm a music bot: play any song here with <code>/play song name</code>.",
+                        parse_mode=ParseMode.HTML, reply_markup=_open_bot_kb(),
+                        disable_web_page_preview=True)
+        spawn(_delete_later(msg, VC_INVITE_DELETE_SEC))
+    except Exception as ex:
+        log.warning("vc_invited error: %s", ex)
+
+
 def _welcome_text(name_html: str, group: str) -> str:
     tpl = WELCOME_TEXT or _DEFAULT_WELCOME
     return tpl.replace("{name}", name_html).replace("{group}", html.escape(group))
@@ -1487,8 +1712,8 @@ async def _do_welcome(chat, users):
     if in_group:  # auto-join group: short welcome in the group
         names = ", ".join(f'<a href="tg://user?id={u.id}">{html.escape(u.first_name or "friend")}</a>'
                           for u in in_group)
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton(
-            "🎧 Open bot", url=f"https://t.me/{BOT_USERNAME}?start=hi")]])
+        kb = InlineKeyboardMarkup([[ibtn(
+            "🎧 Open bot", "success", url=f"https://t.me/{BOT_USERNAME}?start=hi")]])
         msg = await say(chat_id, _welcome_text(names, group), parse_mode=ParseMode.HTML,
                         reply_markup=kb, disable_web_page_preview=True)
         spawn(_delete_later(msg, 60))
@@ -1564,6 +1789,11 @@ async def vcnotice_cmd(_, m: Message):
     await _toggle_cmd(m, "vcnotice", VC_NOTICE_DEFAULT, "Voice chat notices")
 
 
+@bot.on_message(filters.command("vcjoin") & filters.group)
+async def vcjoin_cmd(_, m: Message):
+    await _toggle_cmd(m, "vcjoin", VC_JOIN_DEFAULT, "Voice chat join/invite messages")
+
+
 @bot.on_message(filters.command("welcome") & filters.group)
 async def welcome_cmd(_, m: Message):
     await _toggle_cmd(m, "welcome", WELCOME_DEFAULT, "Welcome messages")
@@ -1633,6 +1863,7 @@ async def setup_cmd(_, m: Message):
 
     on = lambda b: "ON" if b else "OFF"
     lines += ["", f"🎙 Voice chat notices: {on(_setting_on(chat_id, 'vcnotice', VC_NOTICE_DEFAULT))} (/vcnotice)",
+              f"🎧 VC join/invite messages: {on(_setting_on(chat_id, 'vcjoin', VC_JOIN_DEFAULT))} (/vcjoin)",
               f"👋 Welcome messages: {on(_setting_on(chat_id, 'welcome', WELCOME_DEFAULT))} (/welcome)", ""]
     if fixes:
         lines.append("<b>To fix:</b>")
@@ -1743,9 +1974,9 @@ async def radio_cmd(_, m: Message):
     if not await is_admin(m.chat.id, m.from_user.id):
         return await m.reply_text("📻 Only admins can use radio.")
     await m.reply_text(
-        "📻 Radio = automatic trending songs.\nThe menu opens in private chat.",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
-            "Open radio menu", url=f"https://t.me/{BOT_USERNAME}?start=radio_{m.chat.id}")]]),
+        "📻 Radio = automatic trending songs.\nTap Start to choose language and feeling in private chat.",
+        reply_markup=InlineKeyboardMarkup([[ibtn(
+            "▶️ Start", "primary", url=f"https://t.me/{BOT_USERNAME}?start=radio_{m.chat.id}")]]),
     )
 
 
@@ -1877,7 +2108,7 @@ async def like_cb(_, c: CallbackQuery):
             _liked.clear()
         _liked[(key, uid)] = now
         r = db.song_vote(key, cur.get("title"), +1, "radio")
-        await c.answer(f"👍 Liked! Rating {r:+d}")
+        await c.answer("👍 Liked!")
         try:
             await c.message.edit_reply_markup(buttons(chat_id))
         except Exception:
@@ -1919,6 +2150,11 @@ GONE_ERRORS = {"ChatWriteForbidden", "ChannelPrivate", "UserBannedInChannel", "P
 
 
 async def do_broadcast(text: str, st: dict):
+    with costs.job("broadcast"):
+        await _do_broadcast(text, st)
+
+
+async def _do_broadcast(text: str, st: dict):
     ids = db.active_group_ids()
     st["total"] = len(ids)
     for cid in ids:
@@ -2012,12 +2248,14 @@ async def main():
     spawn(assistant_health_loop())
     spawn(idle_leave_loop())
     spawn(flush_loop())
+    spawn(costs.loop(_streams_now))
     log.info("Bot is running as @%s | assistants: %s | radio languages: %s",
              BOT_USERNAME, [a.tag for a in ASSISTANTS], LANGS)
     await idle()
     await notify_shutdown()
     try:
         db.flush_buffers()  # save buffered hit counts / last_used before exit
+        costs.flush()
     except Exception:
         pass
 
